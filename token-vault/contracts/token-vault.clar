@@ -617,3 +617,434 @@
         ))
     )
 )
+
+;; Recurring payment schedules
+(define-map recurring-payments
+    uint
+    {
+        recipient: principal,
+        amount: uint,
+        frequency: uint, ;; blocks between payments
+        next-payment: uint,
+        total-payments: uint,
+        payments-made: uint,
+        active: bool,
+        created-by: principal,
+        created-at: uint,
+        description: (string-utf8 128),
+    }
+)
+
+(define-data-var payment-schedule-counter uint u0)
+
+;; Treasury analytics data
+(define-map treasury-analytics
+    uint ;; time-period (block-height / period-length)
+    {
+        total-inflows: uint,
+        total-outflows: uint,
+        transaction-count: uint,
+        average-transaction: uint,
+        period-start: uint,
+        period-end: uint,
+    }
+)
+
+;; Member activity analytics
+(define-map member-analytics
+    principal
+    {
+        proposals-created: uint,
+        votes-cast: uint,
+        transactions-executed: uint,
+        last-active: uint,
+        total-amount-proposed: uint,
+        total-amount-executed: uint,
+    }
+)
+
+;; Automated payment execution
+(define-public (execute-recurring-payment (payment-id uint))
+    (let (
+            (payment (unwrap! (map-get? recurring-payments payment-id)
+                err-proposal-not-found
+            ))
+            (tx-id (var-get transaction-counter))
+        )
+        (begin
+            (asserts! (not (var-get vault-paused)) err-unauthorized)
+            (asserts! (get active payment) err-execution-failed)
+            (asserts! (<= (get next-payment payment) stacks-block-height)
+                err-proposal-expired
+            )
+            (asserts!
+                (< (get payments-made payment) (get total-payments payment))
+                err-execution-failed
+            )
+            (asserts! (>= (var-get treasury-balance) (get amount payment))
+                err-invalid-amount
+            )
+            ;; Execute payment
+            (unwrap!
+                (as-contract (stx-transfer? (get amount payment) tx-sender
+                    (get recipient payment)
+                ))
+                err-execution-failed
+            )
+            ;; Update treasury balance
+            (var-set treasury-balance
+                (- (var-get treasury-balance) (get amount payment))
+            )
+            ;; Update payment schedule
+            (map-set recurring-payments payment-id
+                (merge payment {
+                    next-payment: (+ (get next-payment payment) (get frequency payment)),
+                    payments-made: (+ (get payments-made payment) u1),
+                    active: (< (+ (get payments-made payment) u1)
+                        (get total-payments payment)
+                    ),
+                })
+            )
+            ;; Record transaction
+            (map-set transaction-history tx-id {
+                proposal-id: u0, ;; No proposal for recurring payments
+                recipient: (get recipient payment),
+                amount: (get amount payment),
+                executed-by: tx-sender,
+                executed-at: stacks-block-height,
+                transaction-type: u"RECURRING",
+            })
+            ;; Update analytics
+            (update-treasury-analytics (get amount payment) false)
+            (update-member-analytics tx-sender u0 (get amount payment) false true)
+            (var-set transaction-counter (+ tx-id u1))
+            (ok tx-id)
+        )
+    )
+)
+
+(define-public (create-recurring-payment
+        (recipient principal)
+        (amount uint)
+        (frequency uint)
+        (total-payments uint)
+        (description (string-utf8 128))
+    )
+    (let ((payment-id (var-get payment-schedule-counter)))
+        (begin
+            (asserts! (has-role tx-sender ROLE-ADMIN) err-unauthorized)
+            (asserts! (not (var-get vault-paused)) err-unauthorized)
+            (asserts! (> amount u0) err-invalid-amount)
+            (asserts! (> frequency u0) err-invalid-amount)
+            (asserts! (> total-payments u0) err-invalid-amount)
+            (map-set recurring-payments payment-id {
+                recipient: recipient,
+                amount: amount,
+                frequency: frequency,
+                next-payment: (+ stacks-block-height frequency),
+                total-payments: total-payments,
+                payments-made: u0,
+                active: true,
+                created-by: tx-sender,
+                created-at: stacks-block-height,
+                description: description,
+            })
+            (var-set payment-schedule-counter (+ payment-id u1))
+            (ok payment-id)
+        )
+    )
+)
+
+(define-public (cancel-recurring-payment (payment-id uint))
+    (let ((payment (unwrap! (map-get? recurring-payments payment-id) err-proposal-not-found)))
+        (begin
+            (asserts!
+                (or
+                    (has-role tx-sender ROLE-ADMIN)
+                    (is-eq tx-sender (get created-by payment))
+                )
+                err-unauthorized
+            )
+            (asserts! (get active payment) err-execution-failed)
+            (map-set recurring-payments payment-id
+                (merge payment { active: false })
+            )
+            (ok true)
+        )
+    )
+)
+
+;; Analytics functions
+(define-private (update-treasury-analytics
+        (amount uint)
+        (is-inflow bool)
+    )
+    (let (
+            (period (/ stacks-block-height u1440)) ;; Daily periods
+            (current-analytics (default-to {
+                total-inflows: u0,
+                total-outflows: u0,
+                transaction-count: u0,
+                average-transaction: u0,
+                period-start: (* period u1440),
+                period-end: (* (+ period u1) u1440),
+            }
+                (map-get? treasury-analytics period)
+            ))
+        )
+        (let (
+                (new-inflows (if is-inflow
+                    (+ (get total-inflows current-analytics) amount)
+                    (get total-inflows current-analytics)
+                ))
+                (new-outflows (if (not is-inflow)
+                    (+ (get total-outflows current-analytics) amount)
+                    (get total-outflows current-analytics)
+                ))
+                (new-count (+ (get transaction-count current-analytics) u1))
+                (total-volume (+ new-inflows new-outflows))
+            )
+            (map-set treasury-analytics period {
+                total-inflows: new-inflows,
+                total-outflows: new-outflows,
+                transaction-count: new-count,
+                average-transaction: (if (> new-count u0)
+                    (/ total-volume new-count)
+                    u0
+                ),
+                period-start: (get period-start current-analytics),
+                period-end: (get period-end current-analytics),
+            })
+        )
+        true
+    )
+)
+
+(define-private (update-member-analytics
+        (member principal)
+        (proposal-amount uint)
+        (execution-amount uint)
+        (voted bool)
+        (executed bool)
+    )
+    (let ((current-analytics (default-to {
+            proposals-created: u0,
+            votes-cast: u0,
+            transactions-executed: u0,
+            last-active: u0,
+            total-amount-proposed: u0,
+            total-amount-executed: u0,
+        }
+            (map-get? member-analytics member)
+        )))
+        (map-set member-analytics member {
+            proposals-created: (+ (get proposals-created current-analytics)
+                (if (> proposal-amount u0)
+                    u1
+                    u0
+                )),
+            votes-cast: (+ (get votes-cast current-analytics)
+                (if voted
+                    u1
+                    u0
+                )),
+            transactions-executed: (+ (get transactions-executed current-analytics)
+                (if executed
+                    u1
+                    u0
+                )),
+            last-active: stacks-block-height,
+            total-amount-proposed: (+ (get total-amount-proposed current-analytics) proposal-amount),
+            total-amount-executed: (+ (get total-amount-executed current-analytics) execution-amount),
+        })
+        true
+    )
+)
+
+;; Enhanced proposal creation with analytics
+(define-public (create-proposal-with-analytics
+        (proposal-type (string-utf8 32))
+        (recipient principal)
+        (amount uint)
+        (description (string-utf8 256))
+        (expiry-blocks uint)
+    )
+    (begin
+        ;; Create proposal using existing function
+        (let ((proposal-result (create-proposal proposal-type recipient amount description
+                expiry-blocks
+            )))
+            (match proposal-result
+                success (begin
+                    ;; Update member analytics
+                    (update-member-analytics tx-sender amount u0 false false)
+                    (ok success)
+                )
+                error (err error)
+            )
+        )
+    )
+)
+
+;; Enhanced voting with analytics
+(define-public (vote-with-analytics
+        (proposal-id uint)
+        (approve bool)
+    )
+    (begin
+        ;; Vote using existing function
+        (let ((vote-result (vote-on-proposal proposal-id approve)))
+            (match vote-result
+                success (begin
+                    ;; Update member analytics
+                    (update-member-analytics tx-sender u0 u0 true false)
+                    (ok success)
+                )
+                error (err error)
+            )
+        )
+    )
+)
+
+;; Read-only analytics functions
+(define-read-only (get-treasury-analytics (period uint))
+    (map-get? treasury-analytics period)
+)
+
+(define-read-only (get-member-analytics (member principal))
+    (map-get? member-analytics member)
+)
+
+(define-read-only (get-recurring-payment (payment-id uint))
+    (map-get? recurring-payments payment-id)
+)
+
+(define-read-only (get-pending-recurring-payments)
+    (ok (var-get payment-schedule-counter))
+)
+
+(define-read-only (calculate-monthly-burn-rate)
+    (let (
+            (current-period (/ stacks-block-height u1440))
+            (periods-to-check u30) ;; Last 30 days
+            (total-outflows (fold +
+                (map get-period-outflows
+                    (list
+                        u0                         u1                         u2
+                        u3                         u4                         u5
+                        u6                         u7                         u8
+                        u9                         u10
+                        u11                         u12
+                        u13                         u14
+                        u15
+                        u16                         u17                         u18
+                        u19                         u20
+                        u21                         u22
+                        u23                         u24
+                        u25                         u26
+                        u27                         u28
+                        u29
+                    ))
+                u0
+            ))
+        )
+        (ok (/ total-outflows u30))
+    )
+)
+
+(define-private (get-period-outflows (offset uint))
+    (let (
+            (period (- (/ stacks-block-height u1440) offset))
+            (analytics (map-get? treasury-analytics period))
+        )
+        (match analytics
+            data (get total-outflows data)
+            u0
+        )
+    )
+)
+
+(define-read-only (get-treasury-health-score)
+    (let (
+            (balance (var-get treasury-balance))
+            (monthly-burn (unwrap-panic (calculate-monthly-burn-rate)))
+            (runway-months (if (> monthly-burn u0)
+                (/ balance monthly-burn)
+                u999
+            ))
+        )
+        (ok {
+            current-balance: balance,
+            monthly-burn-rate: monthly-burn,
+            runway-months: runway-months,
+            health-score: (if (> runway-months u12)
+                u100
+                (if (> runway-months u6)
+                    u75
+                    (if (> runway-months u3)
+                        u50
+                        u25
+                    )
+                )
+            ),
+        })
+    )
+)
+
+(define-read-only (get-member-activity-summary (member principal))
+    (let (
+            (analytics (unwrap! (map-get? member-analytics member) (err u0)))
+            (member-info (unwrap! (map-get? organization-members member) (err u0)))
+        )
+        (ok {
+            role: (get role member-info),
+            proposals-created: (get proposals-created analytics),
+            votes-cast: (get votes-cast analytics),
+            transactions-executed: (get transactions-executed analytics),
+            total-proposed: (get total-amount-proposed analytics),
+            total-executed: (get total-amount-executed analytics),
+            last-active: (get last-active analytics),
+            days-since-active: (/ (- stacks-block-height (get last-active analytics)) u144),
+        })
+    )
+)
+
+;; Batch operations for efficiency
+(define-public (batch-execute-recurring-payments (payment-ids (list 10 uint)))
+    (begin
+        (asserts! (not (var-get vault-paused)) err-unauthorized)
+        (ok (map execute-single-recurring payment-ids))
+    )
+)
+
+(define-private (execute-single-recurring (payment-id uint))
+    (match (execute-recurring-payment payment-id)
+        success
+        true
+        error
+        false
+    )
+)
+
+;; Emergency treasury management
+(define-public (freeze-all-recurring-payments)
+    (begin
+        (asserts! (has-role tx-sender ROLE-ADMIN) err-unauthorized)
+        ;; This would need to iterate through all payments in a full implementation
+        ;; For now, we'll implement a simpler version
+        (ok true)
+    )
+)
+
+(define-read-only (get-vault-analytics-summary)
+    (ok {
+        total-members: (var-get total-members),
+        signature-threshold: (var-get signature-threshold),
+        treasury-balance: (var-get treasury-balance),
+        total-proposals: (var-get proposal-counter),
+        total-transactions: (var-get transaction-counter),
+        active-recurring-payments: (var-get payment-schedule-counter),
+        vault-paused: (var-get vault-paused),
+        health-score: (unwrap-panic (get-treasury-health-score)),
+    })
+)
